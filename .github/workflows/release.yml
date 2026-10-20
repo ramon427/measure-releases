@@ -166,9 +166,8 @@ jobs:
         run: |
           tag="v${{ needs.version.outputs.version }}"
           assets=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
-          channel=latest
-          if [ "${{ inputs.channel }}" = "beta" ]; then channel=beta; fi
-          for file in "$channel.yml" "$channel-mac.yml" "$channel-linux.yml"; do
+          # GitHub releases always carry latest*.yml; prereleases reach beta installs only.
+          for file in latest.yml latest-mac.yml latest-linux.yml; do
             if ! grep -qx "$file" <<<"$assets"; then
               echo "The $tag draft has no $file, so installed copies could not update from it"
               exit 1
