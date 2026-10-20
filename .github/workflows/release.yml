@@ -1,0 +1,181 @@
+# Builds the Measure desktop app from the private ramon427/Measure source and
+# publishes the installers and update feeds here, where installed copies look
+# for updates. Started by hand or from the source repo's tooling:
+#   gh workflow run release.yml -R ramon427/measure-releases -f ref=master
+# Public repositories run Actions for free on every platform; the source is
+# checked out with MEASURE_SOURCE_TOKEN and never committed here.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source branch, tag or commit in ramon427/Measure
+        required: true
+        default: master
+      channel:
+        description: stable for everyone; beta publishes a prerelease for beta testers
+        required: true
+        default: stable
+        type: choice
+        options: [stable, beta]
+      version:
+        description: Version to release (1.2.3); empty bumps the latest release's patch
+        required: false
+
+permissions:
+  contents: read
+
+# One release at a time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve the source commit
+        id: source
+        run: |
+          sha=$(gh api "repos/ramon427/Measure/commits/${{ inputs.ref }}" -q .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.MEASURE_SOURCE_TOKEN }}
+
+      - name: Pick the version
+        id: pick
+        run: |
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            latest=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName' | sed 's/^v//; s/-.*//')
+            if [ -z "$latest" ]; then version="0.1.0"; else
+              IFS=. read -r major minor patch <<<"$latest"; version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+          if [ "${{ inputs.channel }}" = "beta" ] && [[ "$version" != *-* ]]; then
+            version="$version-beta.$(date -u +%Y%m%d%H%M)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # Notes list the desktop app's commits since the last release's source commit.
+      - uses: actions/checkout@v5
+        with:
+          repository: ramon427/Measure
+          ref: ${{ steps.source.outputs.sha }}
+          token: ${{ secrets.MEASURE_SOURCE_TOKEN }}
+          fetch-depth: 0
+          path: source
+
+      - name: Create the draft release
+        run: |
+          tag="v${{ steps.pick.outputs.version }}"
+          previous=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName')
+          since=""
+          if [ -n "$previous" ]; then
+            since=$(gh release view "$previous" -R "$GITHUB_REPOSITORY" --json body -q .body | sed -n 's/.*<!-- source: \([0-9a-f]\{40\}\) -->.*/\1/p')
+          fi
+          range="${since:+$since..}${{ steps.source.outputs.sha }}"
+          {
+            echo "## What's changed"
+            git -C source log --no-merges --format='- %s' "$range" -- apps/desktop-local packages/local-db | grep -v '^- Merge' | head -40
+            echo
+            echo "<!-- source: ${{ steps.source.outputs.sha }} -->"
+          } > notes.md
+          prerelease=""
+          if [ "${{ inputs.channel }}" = "beta" ]; then prerelease="--prerelease"; fi
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --draft $prerelease \
+              --title "${{ steps.pick.outputs.version }}" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32
+            target: --win
+          - os: macos-latest
+            platform: darwin
+            target: --mac
+          - os: ubuntu-latest
+            platform: linux
+            target: --linux
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      MEASURE_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      VITE_MEASURE_VERSION: ${{ needs.version.outputs.version }}
+      MEASURE_RELEASE_SUPABASE_URL: ${{ vars.MEASURE_RELEASE_SUPABASE_URL }}
+      MEASURE_RELEASE_SUPABASE_ANON_KEY: ${{ vars.MEASURE_RELEASE_SUPABASE_ANON_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ramon427/Measure
+          ref: ${{ needs.version.outputs.sha }}
+          token: ${{ secrets.MEASURE_SOURCE_TOKEN }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      # Other install scripts are skipped: better-sqlite3 ships its prebuilt binaries,
+      # and electron-builder downloads Electron itself. Dependency patches still apply.
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      - run: node scripts/dev/apply-dependency-patches.mjs
+
+      - name: Build
+        working-directory: apps/desktop-local
+        run: npm run build
+
+      - name: Stage the app
+        working-directory: apps/desktop-local
+        run: node scripts/stage-release.mjs --platform ${{ matrix.platform }}
+
+      # The draft exists, so electron-builder uploads into it. macOS is signed ad hoc
+      # (no Apple certificate yet): it runs on Apple silicon but can't update itself.
+      - name: Package and upload to the draft release
+        working-directory: apps/desktop-local
+        run: npx electron-builder --projectDir release/app --config ../../electron-builder.config.cjs ${{ matrix.target }} --publish always
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+  # Published only once every platform's feed is uploaded, so installed copies never
+  # see a release without its installer.
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release
+        run: |
+          tag="v${{ needs.version.outputs.version }}"
+          assets=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          channel=latest
+          if [ "${{ inputs.channel }}" = "beta" ]; then channel=beta; fi
+          for file in "$channel.yml" "$channel-mac.yml" "$channel-linux.yml"; do
+            if ! grep -qx "$file" <<<"$assets"; then
+              echo "The $tag draft has no $file, so installed copies could not update from it"
+              exit 1
+            fi
+          done
+          latest="--latest"
+          if [ "${{ inputs.channel }}" = "beta" ]; then latest="--latest=false"; fi
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false $latest
+        env:
+          GH_TOKEN: ${{ github.token }}
