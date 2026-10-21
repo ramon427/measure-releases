@@ -147,21 +147,39 @@ jobs:
 
       # macOS is signed with the Developer ID certificate and notarized with the App Store
       # Connect key, so installed Mac copies can update themselves. Only the Mac job gets
-      # them: electron-builder would otherwise try the Apple certificate on Windows too.
+      # them. The certificate goes into a keychain here rather than through CSC_LINK:
+      # electron-builder unlocks its own keychain with the certificate's password, which
+      # fails on current macOS.
       - name: Prepare macOS signing
         if: matrix.platform == 'darwin'
         run: |
-          key="$RUNNER_TEMP/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -base64 24)
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$MAC_CSC_LINK" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MAC_CSC_KEY_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+          security find-identity -v -p codesigning "$keychain"
+          key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
           printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$key"
           {
-            echo "CSC_LINK=${{ secrets.MAC_CSC_LINK }}"
-            echo "CSC_KEY_PASSWORD=${{ secrets.MAC_CSC_KEY_PASSWORD }}"
+            echo "CSC_NAME=Ramon Verheuvel (W5836LL4H7)"
             echo "APPLE_API_KEY=$key"
-            echo "APPLE_API_KEY_ID=${{ secrets.APPLE_API_KEY_ID }}"
-            echo "APPLE_API_ISSUER=${{ secrets.APPLE_API_ISSUER }}"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
           } >> "$GITHUB_ENV"
         env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
 
       # The draft exists, so electron-builder uploads into it.
       - name: Package and upload to the draft release
@@ -169,7 +187,7 @@ jobs:
         run: npx electron-builder --projectDir release/app --config ../../electron-builder.config.cjs ${{ matrix.target }} --publish always
         env:
           GH_TOKEN: ${{ github.token }}
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ matrix.platform == 'darwin' }}
 
   # Published only once every platform's feed is uploaded, so installed copies never
   # see a release without its installer.
