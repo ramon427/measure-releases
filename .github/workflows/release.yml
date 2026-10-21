@@ -1,6 +1,7 @@
 # Builds the Measure desktop app from the private ramon427/Measure source and
 # publishes the installers and update feeds here, where installed copies look
-# for updates. Started by hand or from the source repo's tooling:
+# for updates. There is one release line: every release is a full release that all
+# installed copies update to. Started by hand or from the source repo's tooling:
 #   gh workflow run release.yml -R ramon427/measure-releases -f ref=master
 # Public repositories run Actions for free on every platform; the source is
 # checked out with MEASURE_SOURCE_TOKEN and never committed here.
@@ -13,12 +14,6 @@ on:
         description: Source branch, tag or commit in ramon427/Measure
         required: true
         default: master
-      channel:
-        description: stable for everyone; beta publishes a prerelease for beta testers
-        required: true
-        default: stable
-        type: choice
-        options: [stable, beta]
       version:
         description: Version to release (1.2.3); empty bumps the latest release's patch
         required: false
@@ -58,9 +53,6 @@ jobs:
               IFS=. read -r major minor patch <<<"$latest"; version="$major.$minor.$((patch + 1))"
             fi
           fi
-          if [ "${{ inputs.channel }}" = "beta" ] && [[ "$version" != *-* ]]; then
-            version="$version-beta.$(date -u +%Y%m%d%H%M)"
-          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,10 +81,8 @@ jobs:
             echo
             echo "<!-- source: ${{ steps.source.outputs.sha }} -->"
           } > notes.md
-          prerelease=""
-          if [ "${{ inputs.channel }}" = "beta" ]; then prerelease="--prerelease"; fi
           gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
-            gh release create "$tag" -R "$GITHUB_REPOSITORY" --draft $prerelease \
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --draft \
               --title "${{ steps.pick.outputs.version }}" --notes-file notes.md
         env:
           GH_TOKEN: ${{ github.token }}
@@ -204,15 +194,12 @@ jobs:
         run: |
           tag="v${{ needs.version.outputs.version }}"
           assets=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
-          # GitHub releases always carry latest*.yml; prereleases reach beta installs only.
           for file in latest.yml latest-linux.yml; do
             if ! grep -qx "$file" <<<"$assets"; then
               echo "The $tag draft has no $file yet; the other build publishes it"
               exit 0
             fi
           done
-          latest="--latest"
-          if [ "${{ inputs.channel }}" = "beta" ]; then latest="--latest=false"; fi
-          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false $latest
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false --latest
         env:
           GH_TOKEN: ${{ github.token }}
