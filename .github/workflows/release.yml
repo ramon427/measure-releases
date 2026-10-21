@@ -145,8 +145,25 @@ jobs:
         working-directory: apps/desktop-local
         run: node scripts/stage-release.mjs --platform ${{ matrix.platform }}
 
-      # The draft exists, so electron-builder uploads into it. macOS is signed ad hoc
-      # (no Apple certificate yet): it runs on Apple silicon but can't update itself.
+      # macOS is signed with the Developer ID certificate and notarized with the App Store
+      # Connect key, so installed Mac copies can update themselves. Only the Mac job gets
+      # them: electron-builder would otherwise try the Apple certificate on Windows too.
+      - name: Prepare macOS signing
+        if: matrix.platform == 'darwin'
+        run: |
+          key="$RUNNER_TEMP/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8"
+          printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$key"
+          {
+            echo "CSC_LINK=${{ secrets.MAC_CSC_LINK }}"
+            echo "CSC_KEY_PASSWORD=${{ secrets.MAC_CSC_KEY_PASSWORD }}"
+            echo "APPLE_API_KEY=$key"
+            echo "APPLE_API_KEY_ID=${{ secrets.APPLE_API_KEY_ID }}"
+            echo "APPLE_API_ISSUER=${{ secrets.APPLE_API_ISSUER }}"
+          } >> "$GITHUB_ENV"
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+
+      # The draft exists, so electron-builder uploads into it.
       - name: Package and upload to the draft release
         working-directory: apps/desktop-local
         run: npx electron-builder --projectDir release/app --config ../../electron-builder.config.cjs ${{ matrix.target }} --publish always
