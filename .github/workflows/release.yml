@@ -191,6 +191,8 @@ jobs:
       # latest-mac.yml until the Mac build lands and keep their current version until then.
       - name: Publish once the Windows and Linux feeds are in
         if: matrix.platform != 'darwin'
+        # Windows runners default to PowerShell.
+        shell: bash
         run: |
           tag="v${{ needs.version.outputs.version }}"
           assets=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
