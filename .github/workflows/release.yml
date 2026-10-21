@@ -97,10 +97,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  # Windows and Linux publish the release as soon as both are in; the Mac build waits on
+  # Apple's notarization queue, which can take hours, and joins the release when it lands.
   build:
     needs: version
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -113,6 +115,7 @@ jobs:
             platform: linux
             target: --linux
     runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.platform == 'darwin' && 180 || 60 }}
     permissions:
       contents: write
     env:
@@ -181,31 +184,31 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
 
-      # The draft exists, so electron-builder uploads into it.
-      - name: Package and upload to the draft release
+      # The release exists, so electron-builder uploads into it. Windows and Linux only
+      # upload into the draft. The Mac build may finish after the release is published, so
+      # it uploads into a published release of any age too (it never creates one).
+      - name: Package and upload to the release
         working-directory: apps/desktop-local
         run: npx electron-builder --projectDir release/app --config ../../electron-builder.config.cjs ${{ matrix.target }} --publish always
         env:
           GH_TOKEN: ${{ github.token }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ matrix.platform == 'darwin' }}
+          EP_PRE_RELEASE: ${{ matrix.platform == 'darwin' }}
+          EP_GH_IGNORE_TIME: ${{ matrix.platform == 'darwin' }}
 
-  # Published only once every platform's feed is uploaded, so installed copies never
-  # see a release without its installer.
-  publish:
-    needs: [version, build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Publish the release
+      # Whichever of Windows and Linux finishes second publishes, so installed Windows and
+      # Linux copies never see a release without their installer. Mac copies find no
+      # latest-mac.yml until the Mac build lands and keep their current version until then.
+      - name: Publish once the Windows and Linux feeds are in
+        if: matrix.platform != 'darwin'
         run: |
           tag="v${{ needs.version.outputs.version }}"
           assets=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
           # GitHub releases always carry latest*.yml; prereleases reach beta installs only.
-          for file in latest.yml latest-mac.yml latest-linux.yml; do
+          for file in latest.yml latest-linux.yml; do
             if ! grep -qx "$file" <<<"$assets"; then
-              echo "The $tag draft has no $file, so installed copies could not update from it"
-              exit 1
+              echo "The $tag draft has no $file yet; the other build publishes it"
+              exit 0
             fi
           done
           latest="--latest"
