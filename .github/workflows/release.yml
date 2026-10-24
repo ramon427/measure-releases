@@ -77,7 +77,7 @@ jobs:
           range="${since:+$since..}${{ steps.source.outputs.sha }}"
           {
             echo "## What's changed"
-            git -C source log --no-merges --format='- %s' "$range" -- apps/desktop-local packages/local-db | grep -v '^- Merge' | head -40
+            git -C source log --no-merges --format='- %s' "$range" -- apps/desktop apps/desktop-local packages/local-db | grep -v '^- Merge' | head -40
             echo
             echo "<!-- source: ${{ steps.source.outputs.sha }} -->"
           } > notes.md
@@ -120,6 +120,11 @@ jobs:
           ref: ${{ needs.version.outputs.sha }}
           token: ${{ secrets.MEASURE_SOURCE_TOKEN }}
 
+      # Sources before 19a4fff53 keep the app in apps/desktop-local.
+      - name: Find the app
+        shell: bash
+        run: echo "APP_DIR=$([ -d apps/desktop ] && echo apps/desktop || echo apps/desktop-local)" >> "$GITHUB_ENV"
+
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -131,12 +136,34 @@ jobs:
       - run: node scripts/dev/apply-dependency-patches.mjs
 
       - name: Build
-        working-directory: apps/desktop-local
+        working-directory: ${{ env.APP_DIR }}
         run: npm run build
 
       - name: Stage the app
-        working-directory: apps/desktop-local
+        working-directory: ${{ env.APP_DIR }}
         run: node scripts/stage-release.mjs --platform ${{ matrix.platform }}
+
+      # Source maps never ship (they hold the source). The Linux job keeps them in a draft
+      # release on the private source repo, where the app's scripts/symbolicate.mjs reads
+      # them to turn reported stacks back into source lines. A failure here never blocks
+      # the release; symbolicate.mjs falls back to rebuilding the release commit.
+      - name: Keep the source maps privately
+        if: matrix.platform == 'linux'
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          GH_TOKEN: ${{ secrets.MEASURE_SOURCE_TOKEN }}
+        run: |
+          [ -d release/sourcemaps ] || { echo "No source maps in this source"; exit 0; }
+          tag="desktop-sourcemaps-v${{ needs.version.outputs.version }}"
+          tar -czf sourcemaps.tar.gz -C release/sourcemaps .
+          gh release view "$tag" -R ramon427/Measure >/dev/null 2>&1 ||
+            gh release create "$tag" -R ramon427/Measure --draft \
+              --target "${{ needs.version.outputs.sha }}" \
+              --title "Desktop ${{ needs.version.outputs.version }} source maps" \
+              --notes "Source maps for symbolicate.mjs. Keep this a draft."
+          gh release upload "$tag" sourcemaps.tar.gz -R ramon427/Measure --clobber
 
       # macOS is signed with the Developer ID certificate and notarized with the App Store
       # Connect key, so installed Mac copies can update themselves. Only the Mac job gets
@@ -178,7 +205,7 @@ jobs:
       # upload into the draft. The Mac build may finish after the release is published, so
       # it uploads into a published release of any age too (it never creates one).
       - name: Package and upload to the release
-        working-directory: apps/desktop-local
+        working-directory: ${{ env.APP_DIR }}
         run: npx electron-builder --projectDir release/app --config ../../electron-builder.config.cjs ${{ matrix.target }} --publish always
         env:
           GH_TOKEN: ${{ github.token }}
