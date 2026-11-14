@@ -17,6 +17,10 @@ on:
       version:
         description: Version to release (1.2.3); empty bumps the latest release's patch
         required: false
+      publish:
+        description: Publish once the Windows and Linux feeds are in (off leaves a draft to check)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -87,10 +91,55 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  # The Research engine runs every AI chat and holds native libraries for one system and
+  # architecture, so each is built where it runs. The Mac build packages both architectures
+  # on an Apple silicon runner, so the Intel engine is built here and handed to it.
+  engine-mac-x64:
+    needs: version
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ramon427/Measure
+          ref: ${{ needs.version.outputs.sha }}
+          token: ${{ secrets.MEASURE_SOURCE_TOKEN }}
+
+      - name: Find the app
+        run: echo "APP_DIR=$([ -d apps/desktop ] && echo apps/desktop || echo apps/desktop-local)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      - run: node scripts/dev/apply-dependency-patches.mjs
+
+      # Sources from before the engine have no build:engine and build nothing here.
+      - name: Build the Research engine
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.['build:engine'] ? 0 : 1)"; then
+            npm run build:engine
+          else
+            echo "This source has no Research engine"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-darwin-x64
+          path: ${{ env.APP_DIR }}/engine/dist
+          if-no-files-found: ignore
+          retention-days: 3
+
   # Windows and Linux publish the release as soon as both are in; the Mac build waits on
   # Apple's notarization queue, which can take hours, and joins the release when it lands.
   build:
-    needs: version
+    needs: [version, engine-mac-x64]
+    # Windows and Linux don't wait on the Intel engine's outcome; the Mac build refuses to
+    # stage without it.
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -138,6 +187,27 @@ jobs:
       - name: Build
         working-directory: ${{ env.APP_DIR }}
         run: npm run build
+
+      # This system's engine (Apple silicon's on the Mac runner). Sources from before the
+      # engine have no build:engine.
+      - name: Build the Research engine
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.['build:engine'] ? 0 : 1)"; then
+            npm run build:engine
+          else
+            echo "This source has no Research engine"
+          fi
+
+      # Staging finds the Intel engine beside this runner's own (engine/dist-*).
+      - name: Fetch the Intel Mac engine
+        if: matrix.platform == 'darwin'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-darwin-x64
+          path: ${{ env.APP_DIR }}/engine/dist-darwin-x64
 
       - name: Stage the app
         working-directory: ${{ env.APP_DIR }}
@@ -217,7 +287,7 @@ jobs:
       # Linux copies never see a release without their installer. Mac copies find no
       # latest-mac.yml until the Mac build lands and keep their current version until then.
       - name: Publish once the Windows and Linux feeds are in
-        if: matrix.platform != 'darwin'
+        if: matrix.platform != 'darwin' && inputs.publish
         # Windows runners default to PowerShell.
         shell: bash
         run: |
